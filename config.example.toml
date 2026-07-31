@@ -3,7 +3,7 @@ layout       = "row"        # "row" (Win7/10 strip) | "grid"
 display      = "thumbnails"   # icons | thumbnails
 columns      = 5            # columns when layout = "grid"
 icon_size    = 96           # px, icon mode
-thumb_width  = 260          # px, thumbnail mode
-thumb_height = 160
+thumb_width  = 440          # px, thumbnail mode
+thumb_height = 275
 title_len    = 28           # max chars of window title shown
 title_size   = 26           # px, window-title font size

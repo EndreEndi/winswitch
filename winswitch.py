@@ -10,7 +10,8 @@ import os, sys, json, socket, subprocess, threading, time
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gtk4LayerShell", "1.0")
-from gi.repository import Gtk, Gdk, GLib, Gio, Gtk4LayerShell as LS
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gtk, Gdk, GLib, Gio, GdkPixbuf, Gtk4LayerShell as LS
 
 try:
     import tomllib
@@ -20,6 +21,14 @@ except Exception:
 CONFIG = os.path.expanduser("~/.config/winswitch/config.toml")
 CACHE = os.path.expanduser("~/.cache/winswitch")
 SOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "winswitch.sock")
+
+# single instance: an abstract unix socket auto-releases when the process dies,
+# so a second launch (e.g. a stray exec-once) just exits instead of piling up.
+_lock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+try:
+    _lock.bind("\0winswitch-overlay")
+except OSError:
+    raise SystemExit(0)
 DEFAULTS = {
     "layout": "row",          # row | grid
     "display": "icons",       # icons | thumbnails (thumbnails fall back to icons if none cached)
@@ -54,7 +63,13 @@ def list_windows():
         cl = json.loads(hypr(["clients", "-j"]) or "[]")
     except Exception:
         cl = []
-    wins = [w for w in cl if w.get("mapped") and (w.get("title") or "").strip()]
+    def real(w):
+        sz = w.get("size") or [0, 0]
+        return bool(w.get("mapped") and not w.get("hidden")
+                    and (w.get("title") or "").strip()
+                    and sz[0] > 0 and sz[1] > 0
+                    and w.get("workspace", {}).get("id", 1) >= 0)
+    wins = [w for w in cl if real(w)]
     wins.sort(key=lambda w: w.get("focusHistoryID", 9999))
     return wins
 
@@ -62,7 +77,7 @@ def list_windows():
 def build_css(cfg):
     return ("""
 #winswitch { background: rgba(15,15,17,0.85); border-radius: 18px; padding: 22px; border: 1px solid rgba(255,255,255,0.08); }
-.wtile { background: transparent; border-radius: 12px; padding: 10px; border: 2px solid transparent; }
+.wtile { background: transparent; border-radius: 10px; padding: 0; border: 2px solid transparent; }
 .wtile.selected { background: rgba(77,184,189,0.18); border: 2px solid #4db8bd; }
 .wthumb { border-radius: 8px; background: rgba(0,0,0,0.35); }
 .wtitle { color: #d8d8d8; font-size: %dpx; margin-top: 8px; }
@@ -153,15 +168,27 @@ class WinSwitch(Gtk.Application):
         if cfg["display"] == "thumbnails":
             p = os.path.join(CACHE, (w.get("address", "").replace("0x", "")) + ".png")
             if os.path.exists(p):
-                pic = Gtk.Picture.new_for_filename(p)
-                pic.set_content_fit(Gtk.ContentFit.COVER)
-                pic.set_hexpand(True)
-                pic.set_vexpand(True)
-                # fixed-size, overflow-clipped box -> exact thumbnail dims, no window over-sizing
+                W, H = int(cfg["thumb_width"]), int(cfg["thumb_height"])
+                try:
+                    # pre-crop to EXACTLY WxH (COVER). Gtk.Picture would otherwise report
+                    # the source image's size as its natural size, inflating the tile and
+                    # leaving empty gaps above/below the thumbnail.
+                    src = GdkPixbuf.Pixbuf.new_from_file(p)
+                    sw, sh = src.get_width(), src.get_height()
+                    scale = max(W / sw, H / sh)
+                    nw, nh = max(W, round(sw * scale)), max(H, round(sh * scale))
+                    scaled = src.scale_simple(nw, nh, GdkPixbuf.InterpType.BILINEAR)
+                    crop = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, scaled.get_has_alpha(), 8, W, H)
+                    scaled.copy_area((nw - W) // 2, (nh - H) // 2, W, H, crop, 0, 0)
+                    pic = Gtk.Picture.new_for_paintable(Gdk.Texture.new_for_pixbuf(crop))
+                except Exception:
+                    pic = Gtk.Picture.new_for_filename(p)
+                    pic.set_content_fit(Gtk.ContentFit.COVER)
+                pic.set_size_request(W, H)
                 box = Gtk.Box()
                 box.add_css_class("wthumb")
                 box.set_overflow(Gtk.Overflow.HIDDEN)
-                box.set_size_request(int(cfg["thumb_width"]), int(cfg["thumb_height"]))
+                box.set_size_request(W, H)
                 box.set_halign(Gtk.Align.CENTER)
                 box.set_valign(Gtk.Align.CENTER)
                 box.append(pic)
@@ -175,6 +202,15 @@ class WinSwitch(Gtk.Application):
         img.set_pixel_size(cfg["icon_size"])
         return img
 
+    def _app_icon(self, w, size=20):
+        it = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+        cand = [(w.get("initialClass") or "").lower(), (w.get("class") or "").lower()]
+        cand += [c.split(".")[-1] for c in cand if c]
+        name = next((c for c in cand if c and it.has_icon(c)), "application-x-executable")
+        img = Gtk.Image.new_from_icon_name(name)
+        img.set_pixel_size(size)
+        return img
+
     def _build(self):
         cfg = self.cfg
         self.tiles = []
@@ -186,17 +222,24 @@ class WinSwitch(Gtk.Application):
         cols = max(1, int(cfg["columns"]))
 
         for i, w in enumerate(self.windows):
-            tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             tile.add_css_class("wtile")
-            tile.append(self._icon_widget(w))
+            # header: app icon + title, ABOVE the thumbnail
+            header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            header.set_size_request(int(cfg["thumb_width"]), -1)
+            header.append(self._app_icon(w))
             t = (w.get("title") or "").strip()
             if len(t) > cfg["title_len"]:
                 t = t[: cfg["title_len"] - 1] + "…"
             lbl = Gtk.Label(label=t)
             lbl.add_css_class("wtitle")
-            lbl.set_max_width_chars(cfg["title_len"])
+            lbl.set_hexpand(True)
+            lbl.set_xalign(0)
+            lbl.set_width_chars(1)  # tiny natural width -> a long title can't widen the tile past the thumbnail
             lbl.set_ellipsize(3)  # END
-            tile.append(lbl)
+            header.append(lbl)
+            tile.append(header)
+            tile.append(self._icon_widget(w))
             # mouse: hover selects, click commits
             click = Gtk.GestureClick()
             click.connect("released", lambda g, n, x, y, idx=i: self.commit(idx))

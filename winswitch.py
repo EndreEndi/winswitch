@@ -80,7 +80,7 @@ def build_css(cfg):
 .wtile { background: transparent; border-radius: 10px; padding: 0; border: 2px solid transparent; }
 .wtile.selected { background: rgba(77,184,189,0.18); border: 2px solid #4db8bd; }
 .wthumb { border-radius: 8px; background: rgba(0,0,0,0.35); }
-.wtitle { color: #d8d8d8; font-size: %dpx; margin-top: 8px; }
+.wtitle { color: #d8d8d8; font-size: %dpx; }
 .wtile.selected .wtitle { color: #ffffff; }
 """ % int(cfg.get("title_size", 15))).encode()
 
@@ -227,7 +227,9 @@ class WinSwitch(Gtk.Application):
             # header: app icon + title, ABOVE the thumbnail
             header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             header.set_size_request(int(cfg["thumb_width"]), -1)
-            header.append(self._app_icon(w))
+            ic = self._app_icon(w)
+            ic.set_valign(Gtk.Align.CENTER)
+            header.append(ic)
             t = (w.get("title") or "").strip()
             if len(t) > cfg["title_len"]:
                 t = t[: cfg["title_len"] - 1] + "…"
@@ -236,6 +238,7 @@ class WinSwitch(Gtk.Application):
             lbl.set_hexpand(True)
             lbl.set_xalign(0)
             lbl.set_width_chars(1)  # tiny natural width -> a long title can't widen the tile past the thumbnail
+            lbl.set_valign(Gtk.Align.CENTER)
             lbl.set_ellipsize(3)  # END
             header.append(lbl)
             tile.append(header)

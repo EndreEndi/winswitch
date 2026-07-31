@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """winswitch — Windows-style Alt+Tab for Hyprland (GTK4 layer-shell).
 
-Runs as a daemon. The Hyprland bind sends 'next'/'prev' over a Unix socket.
-First press opens a centered overlay (MRU order, previous window pre-selected);
-holding Alt + tapping Tab cycles; releasing Alt commits; mouse click commits;
-Esc cancels. Layout (row/grid) and display (icons/thumbnails) are configurable.
+Display-only daemon: the overlay takes NO keyboard grab. All keyboard input is
+owned by the Hyprland "winswitch" submap (see the Lua config), which sends
+'next'/'prev'/'commit'/'cancel' over a Unix socket and polls the physical Alt
+key (hl.is_key_down) to commit the instant Alt is released. The overlay also
+handles the mouse itself (hover selects, click commits). First 'next' opens a
+centered overlay (MRU order, previous window pre-selected); holding Alt + tapping
+Tab cycles; releasing Alt commits. Layout (row/grid) and display
+(icons/thumbnails) are configurable.
 """
-import os, sys, json, socket, subprocess, threading, time
+import os, json, socket, subprocess, threading, time
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gtk4LayerShell", "1.0")
@@ -108,12 +112,13 @@ class WinSwitch(Gtk.Application):
         self.win.set_name("winswitch")
         LS.init_for_window(self.win)
         LS.set_layer(self.win, LS.Layer.OVERLAY)
-        LS.set_keyboard_mode(self.win, LS.KeyboardMode.EXCLUSIVE)
+        # NO keyboard grab: an exclusive grab makes Hyprland continuously toggle
+        # the held Alt modifier (jittery release/press), making a real Alt-release
+        # impossible to detect. So the overlay takes NO keyboard grab; all input is
+        # driven by the Hyprland "winswitch" submap (see hyprland.lua), which polls
+        # the physical Alt key and sends next/prev/commit/cancel over the socket.
+        LS.set_keyboard_mode(self.win, LS.KeyboardMode.NONE)
 
-        kc = Gtk.EventControllerKey()
-        kc.connect("key-pressed", self.on_key_press)
-        kc.connect("key-released", self.on_key_release)
-        self.win.add_controller(kc)
         self.win.set_visible(False)
 
         self.hold()  # stay alive as a daemon even while hidden
@@ -137,15 +142,20 @@ class WinSwitch(Gtk.Application):
                 GLib.idle_add(self.command, data.splitlines()[0])
 
     def command(self, cmd):
+        # commands arrive over the socket from the Hyprland "winswitch" submap
         if cmd == "cancel":
             if self.visible:
                 self.cancel()
+        elif cmd == "commit":
+            # sent when the submap's Alt-poll sees the physical Alt key go up
+            if self.visible:
+                self.commit(self.sel)
         elif cmd in ("next", "prev"):
             d = 1 if cmd == "next" else -1
             if not self.visible:
                 self.show(start=d)
             else:
-                self._advance(d)   # Hyprland re-fires the bind while we're open -> cycle here
+                self._advance(d)
         return False
 
     # ---- show / build ----
@@ -279,42 +289,12 @@ class WinSwitch(Gtk.Application):
             self._refresh_sel()
 
     def _advance(self, delta):
-        # debounced: the socket (Hyprland bind) and a stray key event can both fire per Tab
+        # debounced: rapid repeated "next"/"prev" socket commands collapse to one step
         now = time.monotonic()
         if now - self._last_adv < 0.04:
             return
         self._last_adv = now
         self._move(delta)
-
-    # ---- input ----
-    def on_key_press(self, ctrl, keyval, keycode, state):
-        cfg = self.cfg
-        cols = max(1, int(cfg["columns"])) if cfg["layout"] == "grid" else 1
-        if keyval in (Gdk.KEY_Tab,):
-            self._advance(1)
-        elif keyval in (Gdk.KEY_ISO_Left_Tab,):
-            self._advance(-1)
-        elif keyval == Gdk.KEY_Right:
-            self._move(1)
-        elif keyval == Gdk.KEY_Left:
-            self._move(-1)
-        elif keyval == Gdk.KEY_Down and cfg["layout"] == "grid":
-            self._move(cols)
-        elif keyval == Gdk.KEY_Up and cfg["layout"] == "grid":
-            self._move(-cols)
-        elif keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
-            self.commit(self.sel)
-        elif keyval == Gdk.KEY_Print:
-            self.screenshot()
-        elif keyval == Gdk.KEY_Escape:
-            self.cancel()
-        return True
-
-    def on_key_release(self, ctrl, keyval, keycode, state):
-        # releasing Alt commits — the Windows behaviour
-        if keyval in (Gdk.KEY_Alt_L, Gdk.KEY_Alt_R, Gdk.KEY_Meta_L, Gdk.KEY_Meta_R):
-            self.commit(self.sel)
-        return False
 
     # ---- actions ----
     def commit(self, idx):
@@ -324,7 +304,10 @@ class WinSwitch(Gtk.Application):
         if 0 <= idx < len(self.windows):
             addr = self.windows[idx].get("address")
             if addr:
-                subprocess.Popen(["hyprctl", "dispatch", "focuswindow", f"address:{addr}"])
+                # Lua config: `hyprctl dispatch focuswindow address:X` is parsed as
+                # Lua and fails -- the dispatcher must be the hl.dsp.focus form.
+                subprocess.Popen(["hyprctl", "dispatch",
+                                  'hl.dsp.focus({ window = "address:%s" })' % addr])
 
     def cancel(self):
         self.hide()
@@ -332,14 +315,6 @@ class WinSwitch(Gtk.Application):
     def hide(self):
         self.visible = False
         self.win.set_visible(False)
-
-    def screenshot(self):
-        # capture the whole screen (overlay included) -> clipboard + ~/Pictures/Screenshots
-        subprocess.Popen(
-            "d=~/Pictures/Screenshots; mkdir -p \"$d\"; f=$d/winswitch-$(date +%s).png; "
-            "grim \"$f\" && wl-copy < \"$f\" && "
-            "notify-send -a winswitch 'Switcher captured' \"$f\"",
-            shell=True)
 
 
 if __name__ == "__main__":

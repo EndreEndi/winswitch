@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # winswitch installer — copies the daemons + client into place, drops an example
-# config, and wires the Alt+Tab keybinds into hyprland.conf (idempotent).
+# config, and wires the Alt+Tab submap into hyprland.lua (idempotent).
+# Requires Hyprland 0.55+ with the Lua config (hl.define_submap / hl.is_key_down).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 share="$HOME/.local/share/winswitch"
 bin="$HOME/.local/bin"
 cfg_dir="$HOME/.config/winswitch"
-hypr="${HYPR_CONF:-$HOME/.config/hypr/hyprland.conf}"
+hypr="${HYPR_LUA:-$HOME/.config/hypr/hyprland.lua}"
 
 layer_lib="${GTK4_LAYER_SHELL:-/usr/lib/libgtk4-layer-shell.so}"
 
@@ -40,28 +41,48 @@ else
     install -m 0644 "$here/config.example.toml" "$cfg_dir/config.toml"
 fi
 
-# --- wire hyprland.conf (idempotent) -----------------------------------------
-if [ -f "$hypr" ] && grep -q 'winswitch (Windows-style Alt+Tab)' "$hypr"; then
-    say "hyprland.conf already has the winswitch block — leaving it."
-elif [ -f "$hypr" ]; then
-    say "Adding winswitch keybinds to $hypr"
-    cat >> "$hypr" <<EOF
+# --- wire hyprland.lua (idempotent) ------------------------------------------
+# NOTE: heredoc is unquoted so $share/$bin/$layer_lib expand; the Lua ".." and
+# "{}" are literal (no shell metachars), and Lua uses WS (no leading $).
+read -r -d '' lua_block <<EOF || true
+-- --- winswitch (Windows-style Alt+Tab) ---
+local WS = "$bin/winswitch-send"
+hl.exec_cmd("env LD_PRELOAD=$layer_lib python3 $share/winswitch.py")
+hl.exec_cmd("python3 $share/winswitch-thumbd.py")
+hl.define_submap("winswitch", function()
+    hl.bind("Tab",               hl.dsp.exec_cmd(WS .. " next"))
+    hl.bind("ALT + Tab",         hl.dsp.exec_cmd(WS .. " next"))
+    hl.bind("SHIFT + Tab",       hl.dsp.exec_cmd(WS .. " prev"))
+    hl.bind("ALT + SHIFT + Tab", hl.dsp.exec_cmd(WS .. " prev"))
+    hl.bind("escape", function() hl.exec_cmd(WS .. " cancel"); hl.dispatch(hl.dsp.submap("reset")) end)
+end)
+local function ws_winswitch_poll()
+    if hl.get_current_submap() ~= "winswitch" then return end
+    if hl.is_key_down("Alt_L") or hl.is_key_down("Alt_R") then
+        hl.timer(ws_winswitch_poll, {timeout = 30, type = "oneshot"})
+    else
+        hl.exec_cmd(WS .. " commit"); hl.dispatch(hl.dsp.submap("reset"))
+    end
+end
+local function ws_winswitch_open(dir)
+    hl.exec_cmd(WS .. " " .. dir)
+    hl.dispatch(hl.dsp.submap("winswitch"))
+    hl.timer(ws_winswitch_poll, {timeout = 45, type = "oneshot"})
+end
+hl.bind("ALT + Tab",         function() ws_winswitch_open("next") end)
+hl.bind("ALT + SHIFT + Tab", function() ws_winswitch_open("prev") end)
+-- --- end winswitch ---
+EOF
 
-# --- winswitch (Windows-style Alt+Tab) ---
-exec-once = env LD_PRELOAD=$layer_lib python3 $share/winswitch.py
-exec-once = python3 $share/winswitch-thumbd.py
-bind = ALT, Tab, exec, $bin/winswitch-send next
-bind = ALT SHIFT, Tab, exec, $bin/winswitch-send prev
-# --- end winswitch ---
-EOF
+if [ -f "$hypr" ] && grep -q 'winswitch (Windows-style Alt+Tab)' "$hypr"; then
+    say "hyprland.lua already has the winswitch block — leaving it."
+elif [ -f "$hypr" ]; then
+    say "Adding winswitch submap to $hypr"
+    printf '\n%s\n' "$lua_block" >> "$hypr"
 else
-    warn "No hyprland.conf at $hypr — add these lines to your Hyprland config manually:"
-    cat <<EOF
-exec-once = env LD_PRELOAD=$layer_lib python3 $share/winswitch.py
-exec-once = python3 $share/winswitch-thumbd.py
-bind = ALT, Tab, exec, $bin/winswitch-send next
-bind = ALT SHIFT, Tab, exec, $bin/winswitch-send prev
-EOF
+    warn "No hyprland.lua at $hypr (this needs Hyprland's Lua config, 0.55+)."
+    warn "Add this block to your hyprland.lua manually:"
+    printf '%s\n' "$lua_block"
 fi
 
 say "Done. Reload Hyprland (hyprctl reload) or log out/in, then press Alt+Tab."

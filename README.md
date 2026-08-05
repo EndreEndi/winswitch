@@ -51,12 +51,17 @@ Remove everything with `./uninstall.sh`.
 layout       = "row"        # "row" (Win7/10 strip) | "grid"
 display      = "thumbnails" # "thumbnails" | "icons"
 columns      = 5            # columns when layout = "grid"
+row_max      = 3            # row layout: max tiles per row before wrapping to a grid
 icon_size    = 96           # px, icon mode
 thumb_width  = 260          # px, thumbnail mode
 thumb_height = 160
 title_len    = 28           # max chars of window title shown
 title_size   = 20           # px, window-title font size
 ```
+
+In **row** layout the strip stays a single row until it would exceed `row_max`
+tiles (or the screen width), then wraps onto additional rows so nothing is ever
+clipped, however many windows are open.
 
 ## Keybinds
 

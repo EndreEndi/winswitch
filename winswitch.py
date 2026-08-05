@@ -108,6 +108,16 @@ class WinSwitch(Gtk.Application):
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), self._css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
+        self.hold()  # stay alive as a daemon even while hidden
+        threading.Thread(target=self._sock_thread, daemon=True).start()
+
+    def _create_window(self):
+        # Recreate the overlay window fresh on each open so the layer-shell surface
+        # is measured for the CURRENT tile count. Reusing one window across opens
+        # left the surface sized for a previous (smaller) count, so extra tiles
+        # (e.g. a 3rd window) overflowed and got clipped off-screen.
+        if self.win is not None:
+            self.win.destroy()
         self.win = Gtk.Window(application=self)
         self.win.set_name("winswitch")
         LS.init_for_window(self.win)
@@ -118,11 +128,6 @@ class WinSwitch(Gtk.Application):
         # driven by the Hyprland "winswitch" submap (see hyprland.lua), which polls
         # the physical Alt key and sends next/prev/commit/cancel over the socket.
         LS.set_keyboard_mode(self.win, LS.KeyboardMode.NONE)
-
-        self.win.set_visible(False)
-
-        self.hold()  # stay alive as a daemon even while hidden
-        threading.Thread(target=self._sock_thread, daemon=True).start()
 
     # ---- socket ----
     def _sock_thread(self):
@@ -165,6 +170,7 @@ class WinSwitch(Gtk.Application):
         self.windows = list_windows()
         if not self.windows:
             return
+        self._create_window()  # fresh surface -> sized for the current tile count
         self.sel = (start if start >= 0 else len(self.windows) - 1)
         self.sel %= len(self.windows)
         self._build()
@@ -221,15 +227,41 @@ class WinSwitch(Gtk.Application):
         img.set_pixel_size(size)
         return img
 
+    def _screen_width(self):
+        try:
+            mons = Gdk.Display.get_default().get_monitors()
+            return mons.get_item(0).get_geometry().width  # logical px (scale-adjusted)
+        except Exception:
+            return 1920
+
+    def _cols_for(self, n):
+        # How many tiles per row before wrapping to a grid. Rule: at most
+        # `row_max` (default 3) per row, and never more than physically fit on
+        # screen (so tiles are never clipped on a narrow display).
+        cfg = self.cfg
+        if cfg["layout"] == "grid":
+            return max(1, int(cfg["columns"]))
+        row_max = max(1, int(cfg.get("row_max", 3)))
+        tile_w = (int(cfg["thumb_width"]) if cfg["display"] == "thumbnails"
+                  else max(int(cfg.get("icon_size", 96)) + 40, 160))
+        spacing, pad, margin = 8, 22 * 2, 48  # container spacing, panel padding, safety
+        avail = self._screen_width() - pad - margin
+        fit = max(1, (avail + spacing) // (tile_w + spacing))
+        return int(min(n, row_max, fit))
+
     def _build(self):
         cfg = self.cfg
         self.tiles = []
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        if cfg["layout"] == "grid":
+        cols = self._cols_for(len(self.windows))
+        # wrap into a grid when explicitly gridded, or when a single row would
+        # overflow the screen (more windows than fit across) -> nothing clips.
+        wrap = (cfg["layout"] == "grid") or (len(self.windows) > cols)
+        if wrap:
             container = Gtk.Grid(row_spacing=8, column_spacing=8)
+            container.set_halign(Gtk.Align.CENTER)  # centre a partially-filled last row
         else:
             container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        cols = max(1, int(cfg["columns"]))
 
         for i, w in enumerate(self.windows):
             tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -261,7 +293,7 @@ class WinSwitch(Gtk.Application):
             motion.connect("enter", lambda c, x, y, idx=i: self._select(idx))
             tile.add_controller(motion)
             self.tiles.append(tile)
-            if cfg["layout"] == "grid":
+            if wrap:
                 container.attach(tile, i % cols, i // cols, 1, 1)
             else:
                 container.append(tile)

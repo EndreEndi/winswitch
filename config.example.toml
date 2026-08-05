@@ -2,6 +2,7 @@
 layout       = "row"        # "row" (Win7/10 strip) | "grid"
 display      = "thumbnails"   # icons | thumbnails
 columns      = 5            # columns when layout = "grid"
+row_max      = 3            # row layout: max tiles per row before wrapping to a grid
 icon_size    = 96           # px, icon mode
 thumb_width  = 440          # px, thumbnail mode
 thumb_height = 275

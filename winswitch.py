@@ -10,7 +10,12 @@ centered overlay (MRU order, previous window pre-selected); holding Alt + tappin
 Tab cycles; releasing Alt commits. Layout (row/grid) and display
 (icons/thumbnails) are configurable.
 """
-import os, json, socket, subprocess, threading, time
+import json
+import os
+import socket
+import subprocess
+import threading
+import time
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gtk4LayerShell", "1.0")
@@ -32,7 +37,7 @@ _lock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 try:
     _lock.bind("\0winswitch-overlay")
 except OSError:
-    raise SystemExit(0)
+    raise SystemExit(0) from None
 DEFAULTS = {
     "layout": "row",          # row | grid
     "display": "icons",       # icons | thumbnails (thumbnails fall back to icons if none cached)
@@ -333,13 +338,48 @@ class WinSwitch(Gtk.Application):
         if not self.visible:
             return
         self.hide()
-        if 0 <= idx < len(self.windows):
-            addr = self.windows[idx].get("address")
-            if addr:
-                # Lua config: `hyprctl dispatch focuswindow address:X` is parsed as
-                # Lua and fails -- the dispatcher must be the hl.dsp.focus form.
-                subprocess.Popen(["hyprctl", "dispatch",
-                                  'hl.dsp.focus({ window = "address:%s" })' % addr])
+        if not (0 <= idx < len(self.windows)):
+            return
+        target = self.windows[idx]
+        addr = target.get("address")
+        if not addr:
+            return
+
+        # ⚠⚠ Focusing is NOT enough to make a window visible, and that is the whole
+        # reason "Alt+Tab does nothing when both windows are on the same workspace"
+        # (reported 2026-09-05). Switching ACROSS workspaces always looked fine
+        # because the workspace change itself is the visible event. Within one
+        # workspace two things can leave the newly focused window hidden:
+        #
+        #   * z-order -- a FLOATING sibling sized to the whole screen covers it
+        #     completely, and focus alone does not restack a floating window
+        #     above an equally sized one.
+        #   * fullscreen -- a fullscreen window is drawn above everything else on
+        #     its workspace no matter what the z-order says, so the focused window
+        #     stays behind it.
+        #
+        # So: focus, then raise, then -- only if some OTHER window on that workspace
+        # is fullscreen and ours is not -- hand fullscreen over to ours. That last
+        # step keeps a one-fullscreen-window-per-workspace setup intact: Alt+Tab
+        # swaps WHICH window is fullscreen instead of burying the one you asked
+        # for. It is a no-op on a workspace with nothing fullscreen.
+        ws_id = (target.get("workspace") or {}).get("id")
+        covered = any(o.get("fullscreen")
+                      and o.get("address") != addr
+                      and (o.get("workspace") or {}).get("id") == ws_id
+                      for o in self.windows)
+
+        # Lua config: `hyprctl dispatch focuswindow address:X` is parsed as
+        # Lua and fails -- the dispatcher must be the hl.dsp.focus form.
+        # ⚠ names probed against the LIVE config: bring_to_top() exists,
+        # bringactivetotop()/raise() do not. fullscreen_state acts on the ACTIVE
+        # window, which is why it has to come after the focus in the same batch.
+        steps = ['dispatch hl.dsp.focus({ window = "address:%s" })' % addr,
+                 'dispatch hl.dsp.window.bring_to_top()']
+        if covered and not target.get("fullscreen"):
+            steps.append('dispatch hl.dsp.window.fullscreen_state('
+                         '{ internal = 2, client = 0 })')
+        subprocess.Popen(["hyprctl", "--batch", " ; ".join(steps)])
 
     def cancel(self):
         self.hide()

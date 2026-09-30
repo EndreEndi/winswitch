@@ -377,8 +377,12 @@ class WinSwitch(Gtk.Application):
         steps = ['dispatch hl.dsp.focus({ window = "address:%s" })' % addr,
                  'dispatch hl.dsp.window.bring_to_top()']
         if covered and not target.get("fullscreen"):
-            steps.append('dispatch hl.dsp.window.fullscreen_state('
-                         '{ internal = 2, client = 0 })')
+            # 2026-09-30: the SAME full-screen logic as SUPER+W (EE_fullscreen_toggle in
+            # hyprland.lua), not a raw fullscreen_state. A FLOATING window made full screen
+            # outranks every popup for clicks while the popup is still drawn on top ("visible
+            # but unclickable"), so the Lua function tiles it while it is full screen, and
+            # floats back the window that loses full screen in the hand-over.
+            steps.append("eval EE_fullscreen_toggle()")
         subprocess.Popen(["hyprctl", "--batch", " ; ".join(steps)])
 
     def cancel(self):
